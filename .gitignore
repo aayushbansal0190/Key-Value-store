@@ -1,0 +1,19 @@
+# Build output
+build/
+build-linux/
+*.o
+*.d
+
+# Runtime / test artifacts
+appendonly.aof
+test_aof.tmp
+aof_test_dir/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Personal / local-only docs (kept out of the public repo)
+DOUBTS.md
+NOTES.md

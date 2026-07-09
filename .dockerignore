@@ -1,0 +1,8 @@
+# Keep the build context small and reproducible: never send local build
+# artifacts (Mac-compiled objects!) or git history into the image build.
+build/
+build-*/
+.git/
+*.md
+.dockerignore
+Dockerfile
