@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <climits>
+#include <cstdint>  // SIZE_MAX
 
 #include "aof.h"
 #include "clock.h"
@@ -76,6 +77,68 @@ static bool glob_match(const std::string& pat, const std::string& str) {
     }
     while (p < pat.size() && pat[p] == '*') p++;  // trailing stars match ""
     return p == pat.size();
+}
+
+// Strict UNSIGNED parse for a SCAN cursor: the whole string must be digits,
+// overflow-checked. Cursors are opaque tokens we hand back to the client, so
+// they're size_t, not the signed long long the other commands use.
+static bool parse_cursor(const std::string& s, size_t& out) {
+    if (s.empty()) return false;
+    size_t v = 0;
+    for (char c : s) {
+        if (!isdigit((unsigned char)c)) return false;
+        size_t d = (size_t)(c - '0');
+        if (v > (SIZE_MAX - d) / 10) return false;  // would overflow
+        v = v * 10 + d;
+    }
+    out = v;
+    return true;
+}
+
+// SCAN cursor [MATCH pattern] [COUNT n]: non-blocking, cursor-based keyspace
+// iteration — the production-safe alternative to KEYS. Reply is a 2-element
+// array: the next cursor (a bulk string; "0" means the walk is finished) and
+// the array of keys found this step. Read-only, so never logged to the AOF.
+static std::string cmd_scan(HashTable& store, const std::vector<std::string>& args) {
+    if (args.size() < 2) return err_arity("scan");
+
+    size_t cursor;
+    if (!parse_cursor(args[1], cursor)) {
+        return resp_error("ERR invalid cursor");
+    }
+
+    std::string pattern = "*";  // default: match every key
+    long long count = 10;       // Redis's default COUNT hint
+    for (size_t i = 2; i < args.size();) {
+        std::string opt = to_upper(args[i]);
+        if (opt == "MATCH" && i + 1 < args.size()) {
+            pattern = args[i + 1];
+            i += 2;
+        } else if (opt == "COUNT" && i + 1 < args.size()) {
+            if (!parse_int_arg(args[i + 1], count) || count < 1) {
+                return resp_error("ERR syntax error");
+            }
+            i += 2;
+        } else {
+            return resp_error("ERR syntax error");
+        }
+    }
+
+    std::vector<std::string> found;
+    size_t next = store.scan(cursor, (size_t)count, found);
+
+    // Apply the MATCH glob AFTER scanning: filtering is the command layer's
+    // job (same glob_match as KEYS), keeping the store's scan pattern-agnostic.
+    std::vector<std::string> matched;
+    for (const std::string& k : found) {
+        if (glob_match(pattern, k)) matched.push_back(k);
+    }
+
+    // Nested reply: *2 -> <cursor bulk string> , <array of keys>.
+    std::string out = "*2\r\n";
+    out += resp_bulk(std::to_string(next));
+    out += resp_array(matched);
+    return out;
 }
 
 // SET key value [EX seconds | PX milliseconds]
@@ -200,6 +263,11 @@ std::string execute_command(HashTable& store, const std::vector<std::string>& ar
             if (glob_match(args[1], k)) out.push_back(k);
         }
         return resp_array(out);
+    }
+    if (cmd == "SCAN") {
+        // The non-blocking, cursor-based iterator — safe on a large store
+        // where KEYS would freeze the single thread.
+        return cmd_scan(store, args);
     }
     if (cmd == "FLUSHALL") {
         // Wipe everything. A write, so it's logged — replaying FLUSHALL at

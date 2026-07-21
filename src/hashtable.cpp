@@ -1,6 +1,7 @@
 #include "hashtable.h"
 
 #include <random>
+#include <utility>  // std::swap
 
 #include "clock.h"
 #include "hash.h"  // seeded SipHash-1-2; see hash.h for why keyed hashing
@@ -13,6 +14,20 @@ static size_t bucket_index(uint64_t hash, size_t buckets) {
 
 static bool is_expired(const HashTable::Entry* e, long long now) {
     return e->expires_at >= 0 && e->expires_at <= now;
+}
+
+// Reverse the bits of a value (0b...0001 -> 0b1000...). This is the heart of
+// SCAN's cursor: incrementing a REVERSED counter walks the buckets high-bit
+// first, so when the table doubles, each old bucket's keys land in buckets the
+// cursor hasn't visited yet — never in ones already passed. That's why a scan
+// survives a rehash without missing keys. See HashTable::scan.
+static size_t reverse_bits(size_t v) {
+    size_t r = 0;
+    for (size_t i = 0; i < sizeof(size_t) * 8; i++) {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
+    return r;
 }
 
 // Estimated footprint of one entry: the struct itself plus the key/value
@@ -247,6 +262,59 @@ std::vector<std::string> HashTable::keys() const {
         }
     }
     return out;
+}
+
+size_t HashTable::scan(size_t cursor, size_t count,
+                       std::vector<std::string>& out) const {
+    if (used_ == 0) return 0;
+    long long now = now_ms();
+    size_t v = cursor;
+
+    // Do up to `count` cursor steps per call (COUNT is a hint, like Redis).
+    // do/while so count==0 still makes one step and can't spin forever.
+    size_t steps = 0;
+    do {
+        if (!is_rehashing()) {
+            // Single table: emit one bucket, then reverse-increment the cursor.
+            const std::vector<Entry*>& t0 = ht_[0];
+            size_t mask = t0.size() - 1;  // size is a power of two
+            for (Entry* e = t0[v & mask]; e; e = e->next) {
+                if (!is_expired(e, now)) out.push_back(e->key);
+            }
+            v |= ~mask;               // set the bits ABOVE this table's index
+            v = reverse_bits(v);
+            v++;                      // increment...
+            v = reverse_bits(v);      // ...in reversed space
+        } else {
+            // Mid-rehash: keys live in both tables. Point t_small at the smaller
+            // one, t_big at the larger, and scan the small bucket plus every big
+            // bucket it maps into. (A key in small bucket i is in big bucket
+            // i or i | (small_size) after doubling — the loop below covers all.)
+            const std::vector<Entry*>* t_small = &ht_[0];
+            const std::vector<Entry*>* t_big = &ht_[1];
+            if (t_small->size() > t_big->size()) std::swap(t_small, t_big);
+            size_t m_small = t_small->size() - 1;
+            size_t m_big = t_big->size() - 1;
+
+            for (Entry* e = (*t_small)[v & m_small]; e; e = e->next) {
+                if (!is_expired(e, now)) out.push_back(e->key);
+            }
+            do {
+                for (Entry* e = (*t_big)[v & m_big]; e; e = e->next) {
+                    if (!is_expired(e, now)) out.push_back(e->key);
+                }
+                v |= ~m_big;
+                v = reverse_bits(v);
+                v++;
+                v = reverse_bits(v);
+                // Keep going while the low bits still sit inside the same small
+                // bucket (the bits that differ between the two masks).
+            } while (v & (m_small ^ m_big));
+        }
+        steps++;
+    } while (v != 0 && steps < count);
+
+    return v;  // 0 = iteration complete
 }
 
 void HashTable::clear() {

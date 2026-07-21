@@ -34,10 +34,19 @@ private:
         int fd = -1;
         std::string inbuf;
         std::string outbuf;
+        // How many bytes at the FRONT of outbuf are already sent. We advance
+        // this instead of erase(0, n)-ing after every send (erase shifts the
+        // whole remaining string left — O(remaining) each call, quadratic for
+        // a slow client drained in many small chunks). The already-sent prefix
+        // is physically dropped only occasionally (see try_flush).
+        size_t out_pos = 0;
         // Set on protocol errors: send what's queued (the error message),
         // then close. With framing broken we can't locate the next command,
         // so continuing would risk executing garbage — same policy as Redis.
         bool close_after_reply = false;
+
+        // Unsent reply bytes still queued (outbuf past the already-sent prefix).
+        size_t pending_output() const { return outbuf.size() - out_pos; }
     };
 
     int epfd_ = -1;
@@ -59,3 +68,10 @@ private:
     void update_interest(Conn* c);    // EPOLLIN always; EPOLLOUT iff outbuf pending
     void close_conn(int fd);
 };
+
+// Installs SIGINT/SIGTERM handlers so a running EventLoop stops cleanly at the
+// top of its next iteration (run() returns), letting main()'s destructors flush
+// and fsync the AOF. Without this the default signal action kills the process
+// outright — no destructors, so an everysec AOF can lose its last unsynced
+// second even on a polite Ctrl-C / `kill`. Call once before loop.run().
+void install_shutdown_handlers();

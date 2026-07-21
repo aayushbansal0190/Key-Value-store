@@ -9,6 +9,9 @@ appendonly.aof
 test_aof.tmp
 aof_test_dir/
 
+# Generated docs
+*.pdf
+
 # macOS / editors
 .DS_Store
 .vscode/

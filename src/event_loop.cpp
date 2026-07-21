@@ -11,10 +11,37 @@
 #include <cstdio>
 #include <cstring>
 
+#include <csignal>
+
 #include "aof.h"
 #include "clock.h"
 #include "commands.h"
 #include "resp.h"
+
+// A client that stops reading its socket makes send() back up; its unsent
+// replies pile in outbuf, in OUR memory, without bound. Past this ceiling we
+// give up on that one client and close it, rather than let it OOM the whole
+// server. Generous on purpose: normal clients never approach it (even a single
+// max-size 512MB reply fits), but a stuck one is capped. Redis does the same
+// with client-output-buffer-limit.
+static constexpr size_t CLIENT_OUTBUF_LIMIT = 1024ull * 1024 * 1024;  // 1 GiB
+
+// Ceiling on concurrent clients (Redis's `maxclients` default). Past this,
+// new connections are refused with an error so a connection flood can't
+// exhaust the process's file descriptors.
+static constexpr int MAX_CLIENTS = 10000;
+
+// Set by the signal handler, polled by run(). `volatile sig_atomic_t` is the
+// one type the C++ standard allows a handler to touch safely — a plain bool
+// could be torn or optimized into a register the loop never re-reads.
+static volatile sig_atomic_t g_shutdown = 0;
+
+static void on_shutdown_signal(int) { g_shutdown = 1; }
+
+void install_shutdown_handlers() {
+    signal(SIGINT, on_shutdown_signal);   // Ctrl-C
+    signal(SIGTERM, on_shutdown_signal);  // `kill`, container stop
+}
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -54,13 +81,15 @@ void EventLoop::run() {
     epoll_event events[MAX_EVENTS];
     long long last_tick = now_ms();
 
-    while (true) {
+    while (!g_shutdown) {
         // The single place the whole server sleeps — but now at most 100ms
         // at a time: even a completely idle server wakes up to run the tick
         // (active TTL sweep + finishing any pending rehash).
         int n = epoll_wait(epfd_, events, MAX_EVENTS, TICK_MS);
         if (n < 0) {
-            if (errno == EINTR) continue;  // interrupted by a signal: harmless
+            // A shutdown signal interrupts epoll_wait with EINTR; the loop
+            // condition above then sees g_shutdown and exits cleanly.
+            if (errno == EINTR) continue;
             perror("kvstore: epoll_wait");
             return;
         }
@@ -102,6 +131,10 @@ void EventLoop::run() {
             }
         }
     }
+
+    // Left the loop => a shutdown signal arrived. Returning unwinds main(),
+    // whose ~EventLoop closes the sockets and whose ~Aof fsyncs the log.
+    printf("kvstore: shutting down (signal received)\n");
 }
 
 void EventLoop::handle_accept() {
@@ -118,20 +151,39 @@ void EventLoop::handle_accept() {
             return;
         }
 
+        // Cap concurrent clients so a flood of connections can't exhaust file
+        // descriptors (and the memory each Conn holds). We reply with an error
+        // and drop THIS socket, but keep draining the accept queue. Redis has
+        // the same guard (its `maxclients`, default 10000).
+        if (stats_.connected_clients >= MAX_CLIENTS) {
+            const char* full = "-ERR max number of clients reached\r\n";
+            (void)!write(cfd, full, strlen(full));  // best-effort; ignore result
+            close(cfd);
+            continue;
+        }
+
         // Every client socket must be non-blocking: one slow client's recv
         // or send must never be able to put the whole server to sleep.
         set_nonblocking(cfd);
 
+        epoll_event ev{};
+        ev.events = EPOLLIN;  // EPOLLOUT joins later, only while outbuf pends
+        ev.data.fd = cfd;
+        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+            // Registration failed: this fd would never get events, so it'd be a
+            // silent leak. Drop it now rather than track a dead connection.
+            perror("kvstore: epoll_ctl add");
+            close(cfd);
+            continue;
+        }
+
+        // Registered successfully: NOW record the connection. (Doing this only
+        // after epoll_ctl succeeds keeps conns_ and connected_clients honest.)
         if (cfd >= (int)conns_.size()) conns_.resize(cfd + 1, nullptr);
         Conn* c = new Conn();
         c->fd = cfd;
         conns_[cfd] = c;
         stats_.connected_clients++;
-
-        epoll_event ev{};
-        ev.events = EPOLLIN;  // EPOLLOUT joins later, only while outbuf pends
-        ev.data.fd = cfd;
-        epoll_ctl(epfd_, EPOLL_CTL_ADD, cfd, &ev);
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
@@ -161,34 +213,41 @@ void EventLoop::handle_readable(Conn* c) {
     // Peel as many COMPLETE commands as the buffer holds. Two protocols
     // coexist, dispatched by first byte exactly like Redis: '*' opens a
     // RESP array; anything else is an inline (telnet-style) line.
-    while (!c->inbuf.empty() && !c->close_after_reply) {
-        if (c->inbuf[0] == '*') {
+    //
+    // We walk with a cursor `pos` and drop the consumed prefix ONCE at the end,
+    // instead of erase(0, n) after every command. A client that pipelines N
+    // commands in one packet used to cost O(N^2) (each erase shifts the whole
+    // remaining buffer); now it's O(N) for the pass plus one erase.
+    size_t pos = 0;
+    while (pos < c->inbuf.size() && !c->close_after_reply) {
+        if (c->inbuf[pos] == '*') {
             size_t consumed = 0;
             std::vector<std::string> args;
             std::string perr;
-            ParseResult r = parse_resp_command(c->inbuf, consumed, args, perr);
+            // `consumed` comes back as the ABSOLUTE end index of this command.
+            ParseResult r = parse_resp_command(c->inbuf, pos, consumed, args, perr);
             if (r == ParseResult::Incomplete) break;  // rest still in flight
             if (r == ParseResult::Error) {
                 c->outbuf += resp_error("ERR Protocol error: " + perr);
                 c->close_after_reply = true;
                 break;
             }
-            c->inbuf.erase(0, consumed);
+            pos = consumed;
             if (!args.empty())
                 c->outbuf += execute_command(store_, args, aof_, &stats_);
         } else {
-            size_t nl = c->inbuf.find('\n');
+            size_t nl = c->inbuf.find('\n', pos);
             if (nl == std::string::npos) {
                 // No terminator yet — but cap how long we'll wait for one:
                 // an endless unterminated line is memory abuse, not a command.
-                if (c->inbuf.size() > RESP_MAX_INLINE) {
+                if (c->inbuf.size() - pos > RESP_MAX_INLINE) {
                     c->outbuf += resp_error("ERR Protocol error: too big inline request");
                     c->close_after_reply = true;
                 }
                 break;
             }
-            std::string line = c->inbuf.substr(0, nl);
-            c->inbuf.erase(0, nl + 1);
+            std::string line = c->inbuf.substr(pos, nl - pos);
+            pos = nl + 1;
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
             std::vector<std::string> args = split_inline(line);
@@ -196,12 +255,13 @@ void EventLoop::handle_readable(Conn* c) {
             c->outbuf += execute_command(store_, args, aof_, &stats_);
         }
     }
+    if (pos > 0) c->inbuf.erase(0, pos);  // drop all consumed commands at once
 
     if (!try_flush(c)) {
         close_conn(c->fd);
         return;
     }
-    if (c->close_after_reply && c->outbuf.empty()) close_conn(c->fd);
+    if (c->close_after_reply && c->pending_output() == 0) close_conn(c->fd);
 }
 
 void EventLoop::handle_writable(Conn* c) {
@@ -211,19 +271,43 @@ void EventLoop::handle_writable(Conn* c) {
         return;
     }
     // A protocol-error reply may have finished draining only now.
-    if (c->close_after_reply && c->outbuf.empty()) close_conn(c->fd);
+    if (c->close_after_reply && c->pending_output() == 0) close_conn(c->fd);
 }
 
 bool EventLoop::try_flush(Conn* c) {
-    while (!c->outbuf.empty()) {
-        ssize_t n = send(c->fd, c->outbuf.data(), c->outbuf.size(), 0);
+    // Send from the cursor forward. out_pos advances instead of erasing the
+    // front each time (see Conn::out_pos).
+    while (c->out_pos < c->outbuf.size()) {
+        ssize_t n = send(c->fd, c->outbuf.data() + c->out_pos,
+                         c->outbuf.size() - c->out_pos, 0);
         if (n > 0) {
-            c->outbuf.erase(0, (size_t)n);
+            c->out_pos += (size_t)n;
             continue;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // kernel full; wait for EPOLLOUT
         return false;  // peer vanished mid-reply etc.
     }
+
+    // Reclaim the already-sent prefix. If everything drained, just reset the
+    // cursor (no copy). Otherwise physically drop the sent bytes so outbuf
+    // can't grow forever behind a stuck cursor — but only past a threshold,
+    // so a busy fast client isn't erasing tiny prefixes constantly.
+    if (c->out_pos == c->outbuf.size()) {
+        c->outbuf.clear();
+        c->out_pos = 0;
+    } else if (c->out_pos > 64 * 1024) {
+        c->outbuf.erase(0, c->out_pos);
+        c->out_pos = 0;
+    }
+
+    // Backpressure guard: a client that won't read makes pending replies pile
+    // up unbounded. Past the ceiling, drop it rather than risk the whole server.
+    if (c->pending_output() > CLIENT_OUTBUF_LIMIT) {
+        fprintf(stderr, "kvstore: client fd=%d exceeded output buffer limit; closing\n",
+                c->fd);
+        return false;
+    }
+
     update_interest(c);
     return true;
 }
@@ -234,7 +318,7 @@ void EventLoop::update_interest(Conn* c) {
     // doing nothing. This toggle is the standard pattern.
     epoll_event ev{};
     ev.events = EPOLLIN;
-    if (!c->outbuf.empty()) ev.events |= EPOLLOUT;
+    if (c->pending_output() > 0) ev.events |= EPOLLOUT;
     ev.data.fd = c->fd;
     epoll_ctl(epfd_, EPOLL_CTL_MOD, c->fd, &ev);
 }

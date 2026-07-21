@@ -36,25 +36,33 @@ static bool parse_ll(const std::string& buf, size_t start, size_t end, long long
 
 ParseResult parse_resp_command(const std::string& buf, size_t& consumed,
                                std::vector<std::string>& args, std::string& err) {
+    // Thin wrapper: parse from the very front. `consumed` then equals the
+    // number of bytes the command occupied (start is 0, so absolute == count).
+    return parse_resp_command(buf, 0, consumed, args, err);
+}
+
+ParseResult parse_resp_command(const std::string& buf, size_t start, size_t& consumed,
+                               std::vector<std::string>& args, std::string& err) {
     args.clear();
-    if (buf.empty() || buf[0] != '*') {
+    if (start >= buf.size() || buf[start] != '*') {
         err = "expected '*' as first byte";
         return ParseResult::Error;
     }
 
     // Header: *<count>\r\n
     size_t crlf;
-    if (!find_crlf(buf, 1, crlf)) {
+    if (!find_crlf(buf, start + 1, crlf)) {
         // No terminator yet. A count line can't legitimately be this long —
-        // don't let a client feed us an endless header.
-        if (buf.size() > 32) {
+        // don't let a client feed us an endless header. (Measure from `start`,
+        // not the whole buffer, so earlier commands don't count toward it.)
+        if (buf.size() - start > 32) {
             err = "invalid multibulk length";
             return ParseResult::Error;
         }
         return ParseResult::Incomplete;
     }
     long long count;
-    if (!parse_ll(buf, 1, crlf, count) || count < 0 || count > RESP_MAX_MULTIBULK) {
+    if (!parse_ll(buf, start + 1, crlf, count) || count < 0 || count > RESP_MAX_MULTIBULK) {
         err = "invalid multibulk length";
         return ParseResult::Error;
     }
@@ -105,7 +113,17 @@ std::string resp_simple(const std::string& s) {
 }
 
 std::string resp_error(const std::string& msg) {
-    return "-" + msg + "\r\n";
+    // Error messages sometimes interpolate untrusted bytes (e.g. an unknown
+    // command name, which the client fully controls and RESP lets contain any
+    // byte including CR/LF). A raw \r\n inside the message would prematurely
+    // terminate this error line and let the client inject fake reply lines into
+    // its own stream. Neutralize line breaks to spaces — the ONE place every
+    // error reply is built, so no caller can forget. (Redis sanitizes too.)
+    std::string safe = msg;
+    for (char& ch : safe) {
+        if (ch == '\r' || ch == '\n') ch = ' ';
+    }
+    return "-" + safe + "\r\n";
 }
 
 std::string resp_integer(long long n) {

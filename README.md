@@ -29,7 +29,10 @@ $ redis-cli -p 6379 ttl user:1
 - Append-only-file persistence with `always`/`everysec`/`no` fsync policies.
   Kill the server, restart, the data (including TTLs) is still there.
 - Commands: `PING ECHO SET GET DEL EXISTS EXPIRE TTL PERSIST PEXPIREAT KEYS
-  FLUSHALL DBSIZE INFO`.
+  SCAN FLUSHALL DBSIZE INFO`.
+- `SCAN cursor [MATCH pattern] [COUNT n]`: cursor-based, non-blocking keyspace
+  iteration (the production-safe alternative to `KEYS`) — correct even while the
+  hash table is resizing underneath the scan.
 
 ## Build and run
 

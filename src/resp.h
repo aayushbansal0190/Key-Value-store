@@ -34,6 +34,16 @@ enum class ParseResult {
 ParseResult parse_resp_command(const std::string& buf, size_t& consumed,
                                std::vector<std::string>& args, std::string& err);
 
+// Same as above, but parses the command that begins at buf[start] instead of
+// buf[0]. `consumed` is set to the ABSOLUTE end index of the command (so the
+// caller advances a cursor to it), not the number of bytes past `start`. This
+// lets the event loop walk many pipelined commands with a moving cursor and
+// erase the consumed prefix once, instead of erase(0, n) per command (which is
+// O(remaining) each time — quadratic over a big pipeline). The zero-argument
+// front-of-buffer form above is just this with start = 0.
+ParseResult parse_resp_command(const std::string& buf, size_t start, size_t& consumed,
+                               std::vector<std::string>& args, std::string& err);
+
 // Reply serializers — the five RESP2 reply types we use.
 std::string resp_simple(const std::string& s);   // +OK\r\n       (status)
 std::string resp_error(const std::string& msg);  // -ERR ...\r\n  (error)

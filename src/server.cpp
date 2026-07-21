@@ -67,6 +67,11 @@ int main(int argc, char** argv) {
     // A peer-closed socket write must be an error code, not a process death.
     signal(SIGPIPE, SIG_IGN);
 
+    // Ctrl-C / `kill` now stops the loop cleanly (run() returns) so the AOF is
+    // flushed by main()'s destructors, instead of the process being killed
+    // outright with unsynced writes still in the kernel's page cache.
+    install_shutdown_handlers();
+
     int lfd = make_listen_socket(cfg.port);
     if (lfd < 0) return 1;
 

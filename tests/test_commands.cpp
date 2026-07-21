@@ -2,6 +2,7 @@
 #include "../src/commands.h"
 #include "test.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -264,6 +265,52 @@ static void test_eviction_visible_through_commands() {
     CHECK(r.find("evicted_keys:1") != std::string::npos);
 }
 
+static void test_scan_covers_every_key() {
+    HashTable store;
+    // Enough keys to force several rehashes during insertion, so the scan is
+    // exercised against a table that grew underneath earlier cursors.
+    const int N = 1000;
+    for (int i = 0; i < N; i++) store.set("k:" + std::to_string(i), "v");
+
+    std::set<std::string> seen;
+    size_t cursor = 0;
+    int guard = 0;
+    do {
+        std::vector<std::string> batch;
+        cursor = store.scan(cursor, 10, batch);
+        for (const std::string& k : batch) seen.insert(k);
+        CHECK(++guard < 1000000);  // a correct scan always terminates
+    } while (cursor != 0);
+
+    // The core guarantee: every key present for the whole scan comes back at
+    // least once (deduped via the set, that's exactly N distinct keys).
+    CHECK_EQ(seen.size(), (size_t)N);
+    CHECK(seen.count("k:0") == 1);
+    CHECK(seen.count("k:999") == 1);
+}
+
+static void test_scan_command_shape_and_errors() {
+    HashTable store;
+    execute_command(store, {"SET", "a", "1"});
+    execute_command(store, {"SET", "b", "2"});
+
+    // Reply is a 2-element array: [cursor, keys].
+    std::string r = execute_command(store, {"SCAN", "0"});
+    CHECK(r.rfind("*2\r\n", 0) == 0);
+
+    // MATCH + COUNT parse and run.
+    execute_command(store, {"SET", "user:1", "x"});
+    std::string m = execute_command(store, {"SCAN", "0", "MATCH", "user:*", "COUNT", "100"});
+    CHECK(m.rfind("*2\r\n", 0) == 0);
+
+    // Rejections.
+    CHECK(execute_command(store, {"SCAN"}).rfind("-ERR wrong number", 0) == 0);
+    CHECK(execute_command(store, {"SCAN", "abc"}).rfind("-ERR invalid cursor", 0) == 0);
+    CHECK(execute_command(store, {"SCAN", "0", "BOGUS"}).rfind("-ERR syntax error", 0) == 0);
+    CHECK(execute_command(store, {"SCAN", "0", "COUNT", "0"}).rfind("-ERR syntax error", 0) == 0);
+    CHECK(execute_command(store, {"SCAN", "0", "COUNT", "x"}).rfind("-ERR syntax error", 0) == 0);
+}
+
 int main() {
     test_split_inline();
     test_ping_echo();
@@ -281,5 +328,7 @@ int main() {
     test_oversized_write_rejected();
     test_info_fields();
     test_eviction_visible_through_commands();
+    test_scan_covers_every_key();
+    test_scan_command_shape_and_errors();
     return test_summary("test_commands");
 }

@@ -18,6 +18,11 @@ static void test_serializers() {
 
     std::string binary("a\r\nb\0c", 6);              // CRLF and NUL inside data
     CHECK(resp_bulk(binary) == std::string("$6\r\na\r\nb\0c\r\n", 12));
+
+    // Error messages neutralize embedded CR/LF (an unknown command name is
+    // client-controlled) so they can't inject extra reply lines. The message
+    // stays a single line; only the trailing framing CRLF remains.
+    CHECK(resp_error("ERR bad\r\n+INJECTED") == "-ERR bad  +INJECTED\r\n");
 }
 
 static void test_parse_complete_command() {

@@ -63,6 +63,21 @@ public:
     // exists only for the KEYS debug command; never used on a hot path.
     std::vector<std::string> keys() const;
 
+    // Cursor-based, NON-blocking iteration (powers the SCAN command). One call
+    // visits a bounded handful of buckets starting from `cursor`, appends their
+    // live keys to `out`, and returns the NEXT cursor; a returned 0 means the
+    // full pass is done. Unlike keys(), this never walks the whole table at
+    // once, so it can't stall the single thread on a big store.
+    //
+    // The magic is the cursor scheme (Redis's): buckets are visited in
+    // reverse-binary-increment order, which keeps the guarantee "every key
+    // present for the whole scan is returned at least once" holding EVEN IF the
+    // table doubles (rehashes) between calls. Keys may repeat and the count per
+    // call only approximates `count` — both are fine and match Redis. Expired-
+    // but-unreaped keys are skipped (like keys()); this is a read, it reaps
+    // nothing.
+    size_t scan(size_t cursor, size_t count, std::vector<std::string>& out) const;
+
     // Deletes everything (FLUSHALL): entries, LRU list, memory accounting,
     // any in-flight rehash. Lifetime stats (evicted/expired) survive — they
     // count events, not contents.
